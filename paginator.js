@@ -451,6 +451,8 @@ export class Paginator extends HTMLElement {
     #lastVisibleRange
     constructor() {
         super()
+        // Nyxa: proof that the app uses my fork
+        console.log('Nyxa: my own foliate-js')
         this.#root.innerHTML = `<style>
         :host {
             display: block;
