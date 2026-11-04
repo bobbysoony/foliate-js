@@ -449,10 +449,11 @@ export class Paginator extends HTMLElement {
     #touchState
     #touchScrolled
     #lastVisibleRange
+    // Nyxa: the chapters on the page, top to bottom, as { index, view }
+    #stack = []
+    #filling = false
     constructor() {
         super()
-        // Nyxa: proof that the app uses my fork
-        console.log('Nyxa: my own foliate-js')
         this.#root.innerHTML = `<style>
         :host {
             display: block;
@@ -559,6 +560,8 @@ export class Paginator extends HTMLElement {
 
         this.#observer.observe(this.#container)
         this.#container.addEventListener('scroll', () => this.dispatchEvent(new Event('scroll')))
+        // Nyxa: near the bottom? load the next chapter
+        this.#container.addEventListener('scroll', () => this.#fill().catch(e => console.warn(e)))
         this.#container.addEventListener('scroll', debounce(() => {
             if (this.scrolled) {
                 if (this.#justAnchored) this.#justAnchored = false
@@ -666,16 +669,58 @@ export class Paginator extends HTMLElement {
         })
     }
     #createView() {
-        if (this.#view) {
-            this.#view.destroy()
-            this.#container.removeChild(this.#view.element)
-        }
-        this.#view = new View({
+        // Nyxa: a jump starts a new stack. Free the old chapters, but don't
+        // unload the one being opened: it was just loaded again
+        for (const entry of this.#stack) this.#free(entry, entry.index !== this.#index)
+        this.#filling = false
+        const view = new View({
             container: this,
-            onExpand: () => this.#scrollToAnchor(this.#anchor),
+            onExpand: () => this.#onExpand(view),
         })
-        this.#container.append(this.#view.element)
-        return this.#view
+        this.#container.append(view.element)
+        this.#view = view
+        this.#stack = [{ index: this.#index, view }]
+        return view
+    }
+    // Nyxa: take one chapter off the page
+    #free({ index, view }, unload = true) {
+        view.destroy()
+        view.element.remove()
+        if (unload) this.sections[index]?.unload?.()
+    }
+    // Nyxa: a chapter changed height. The current one keeps your place, like before
+    #onExpand(view) {
+        if (view === this.#view) this.#scrollToAnchor(this.#anchor)
+    }
+    // Nyxa: less than 2 screens of story left below? add the next chapter
+    async #fill() {
+        if (!this.#stacking || this.#filling || !this.#view) return
+        const next = this.#adjacentIndex(1, this.#stack.at(-1).index)
+        if (next == null || this.#container.scrollHeight - this.end > this.size * 2) return
+        this.#filling = true
+        if (!(await this.#addChapter(next))) return // a jump happened meanwhile
+        this.#filling = false
+        await this.#fill() // a short chapter may not be enough
+    }
+    // Nyxa: load one chapter into a new view at the bottom of the stack
+    async #addChapter(index) {
+        const stack = this.#stack
+        const src = await this.sections[index].load()
+        if (stack !== this.#stack) return false
+        const view = new View({
+            container: this,
+            onExpand: () => this.#onExpand(view),
+        })
+        stack.push({ index, view })
+        this.#container.append(view.element)
+        await view.load(src, doc => {
+            this.#addStyleElements(doc)
+            this.#applyStyles(view)
+            this.dispatchEvent(new CustomEvent('load', { detail: { doc, index } }))
+        }, this.#beforeRender.bind(this))
+        if (stack !== this.#stack) return false
+        this.#attachOverlayer(view, index)
+        return true
     }
     #beforeRender({ vertical, rtl, background }) {
         this.#vertical = vertical
@@ -755,14 +800,25 @@ export class Paginator extends HTMLElement {
     }
     render() {
         if (!this.#view) return
-        this.#view.render(this.#beforeRender({
+        // Nyxa: page mode shows one chapter, so free the others
+        if (!this.#stacking) {
+            for (const entry of this.#stack) if (entry.view !== this.#view) this.#free(entry)
+            this.#stack = [{ index: this.#index, view: this.#view }]
+            this.#filling = false
+        }
+        const layout = this.#beforeRender({
             vertical: this.#vertical,
             rtl: this.#rtl,
-        }))
+        })
+        for (const { view } of this.#stack) view.render(layout)
         this.#scrollToAnchor(this.#anchor)
     }
     get scrolled() {
         return this.getAttribute('flow') === 'scrolled'
+    }
+    // Nyxa: chapters stack top to bottom when you scroll down the page
+    get #stacking() {
+        return this.scrolled && !this.#vertical
     }
     get scrollProp() {
         const { scrolled } = this
@@ -969,6 +1025,7 @@ export class Paginator extends HTMLElement {
             detail.size = 1 / (pages - 2)
         }
         this.dispatchEvent(new CustomEvent('relocate', { detail }))
+        this.#fill().catch(e => console.warn(e))
     }
     async #display(promise) {
         const { index, src, anchor, onLoad, select } = await promise
@@ -977,33 +1034,42 @@ export class Paginator extends HTMLElement {
         if (src) {
             const view = this.#createView()
             const afterLoad = doc => {
-                if (doc.head) {
-                    const $styleBefore = doc.createElement('style')
-                    doc.head.prepend($styleBefore)
-                    const $style = doc.createElement('style')
-                    doc.head.append($style)
-                    this.#styleMap.set(doc, [$styleBefore, $style])
-                }
+                this.#addStyleElements(doc)
                 onLoad?.({ doc, index })
             }
             const beforeRender = this.#beforeRender.bind(this)
             await view.load(src, afterLoad, beforeRender)
-            this.dispatchEvent(new CustomEvent('create-overlayer', {
-                detail: {
-                    doc: view.document, index,
-                    attach: overlayer => view.overlayer = overlayer,
-                },
-            }))
+            this.#attachOverlayer(view, index)
             this.#view = view
         }
         await this.scrollToAnchor((typeof anchor === 'function'
             ? anchor(this.#view.document) : anchor) ?? 0, select)
         if (hasFocus) this.focusView()
     }
+
+    // Nyxa: moved out of #display so stacked chapters can use them too
+    #addStyleElements(doc) {
+        if (doc.head) {
+            const $styleBefore = doc.createElement('style')
+            doc.head.prepend($styleBefore)
+            const $style = doc.createElement('style')
+            doc.head.append($style)
+            this.#styleMap.set(doc, [$styleBefore, $style])
+        }
+    }
+    #attachOverlayer(view, index) {
+        this.dispatchEvent(new CustomEvent('create-overlayer', {
+            detail: {
+                doc: view.document, index,
+                attach: overlayer => view.overlayer = overlayer,
+            },
+        }))
+    }
+
     #canGoToIndex(index) {
         return index >= 0 && index <= this.sections.length - 1
     }
-    async #goTo({ index, anchor, select}) {
+    async #goTo({ index, anchor, select }) {
         if (index === this.#index) await this.#display({ index, anchor, select })
         else {
             const oldIndex = this.#index
@@ -1040,8 +1106,10 @@ export class Paginator extends HTMLElement {
     #scrollNext(distance) {
         if (!this.#view) return true
         if (this.scrolled) {
-            if (this.viewSize - this.end > 2) return this.#scrollTo(
-                Math.min(this.viewSize, distance ? this.start + distance : this.end), null, true)
+            // Nyxa: scroll through every chapter in the stack, not just the first
+            const size = this.#stacking ? this.#container.scrollHeight : this.viewSize
+            if (size - this.end > 2) return this.#scrollTo(
+                Math.min(size, distance ? this.start + distance : this.end), null, true)
             return true
         }
         if (this.atEnd) return
@@ -1055,8 +1123,8 @@ export class Paginator extends HTMLElement {
     get atEnd() {
         return this.#adjacentIndex(1) == null && this.page >= this.pages - 2
     }
-    #adjacentIndex(dir) {
-        for (let index = this.#index + dir; this.#canGoToIndex(index); index += dir)
+    #adjacentIndex(dir, from = this.#index) {
+        for (let index = from + dir; this.#canGoToIndex(index); index += dir)
             if (this.sections[index]?.linear !== 'no') return index
     }
     async #turnPage(dir, distance) {
@@ -1092,16 +1160,20 @@ export class Paginator extends HTMLElement {
         return this.goTo({ index })
     }
     getContents() {
-        if (this.#view) return [{
-            index: this.#index,
-            overlayer: this.#view.overlayer,
-            doc: this.#view.document,
-        }]
-        return []
+        // Nyxa: every chapter in the stack, the current one first
+        if (!this.#view) return []
+        const others = this.#stack.filter(({ view }) => view !== this.#view)
+        return [{ index: this.#index, view: this.#view }, ...others]
+            .map(({ index, view }) => ({ index, overlayer: view.overlayer, doc: view.document }))
     }
     setStyles(styles) {
         this.#styles = styles
-        const $$styles = this.#styleMap.get(this.#view?.document)
+        // Nyxa: every chapter in the stack gets the new look
+        for (const { view } of this.#stack) this.#applyStyles(view)
+    }
+    #applyStyles(view) {
+        const styles = this.#styles
+        const $$styles = this.#styleMap.get(view.document)
         if (!$$styles) return
         const [$beforeStyle, $style] = $$styles
         if (Array.isArray(styles)) {
@@ -1115,16 +1187,17 @@ export class Paginator extends HTMLElement {
             this.#background.style.background = getBackground(this.#view.document))
 
         // needed because the resize observer doesn't work in Firefox
-        this.#view?.document?.fonts?.ready?.then(() => this.#view.expand())
+        view.document?.fonts?.ready?.then(() => view.expand())
     }
     focusView() {
         this.#view.document.defaultView.focus()
     }
     destroy() {
         this.#observer.unobserve(this)
-        this.#view.destroy()
+        // Nyxa: free every chapter in the stack
+        for (const entry of this.#stack) this.#free(entry)
+        this.#stack = []
         this.#view = null
-        this.sections[this.#index]?.unload?.()
         this.#mediaQuery.removeEventListener('change', this.#mediaQueryListener)
     }
 }
