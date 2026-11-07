@@ -1,3 +1,5 @@
+import { chapterAt } from './stack.js'
+
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
 
 const debounce = (f, wait, immediate) => {
@@ -452,6 +454,7 @@ export class Paginator extends HTMLElement {
     // Nyxa: the chapters on the page, top to bottom, as { index, view }
     #stack = []
     #filling = false
+    #waiting = null
     constructor() {
         super()
         this.#root.innerHTML = `<style>
@@ -700,6 +703,11 @@ export class Paginator extends HTMLElement {
         this.#filling = true
         if (!(await this.#addChapter(next))) return // a jump happened meanwhile
         this.#filling = false
+        if (this.#waiting) {
+            const { place, select } = this.#waiting
+            await this.scrollToAnchor(place, select)
+            if (!this.#atBottom()) this.#waiting = null
+        }
         await this.#fill() // a short chapter may not be enough
     }
     // Nyxa: load one chapter into a new view at the bottom of the stack
@@ -820,6 +828,20 @@ export class Paginator extends HTMLElement {
     get #stacking() {
         return this.scrolled && !this.#vertical
     }
+    // Nyxa: how far down the stack a chapter starts, in pixels
+    #offsetOf(view) {
+        if (!this.#stacking) return 0
+        const top = this.#container.getBoundingClientRect().top
+        return view.element.getBoundingClientRect().top - top + this.#container.scrollTop
+    }
+    // Nyxa: the chapter at the top of the screen becomes the current one
+    #followScreen() {
+        if (!this.#stacking) return
+        const tops = this.#stack.map(({ view }) => this.#offsetOf(view))
+        const { index, view } = this.#stack[chapterAt(tops, this.start)]
+        this.#index = index
+        this.#view = view
+    }
     get scrollProp() {
         const { scrolled } = this
         return this.#vertical ? (scrolled ? 'scrollLeft' : 'scrollTop')
@@ -925,10 +947,13 @@ export class Paginator extends HTMLElement {
         if (this.scrolled) {
             const size = this.viewSize
             const margin = this.#margin
+            // Nyxa: the current chapter may start lower down the stack
+            const offset = this.#offsetOf(this.#view)
             return this.#vertical
                 ? ({ left, right }) =>
                     ({ left: size - right - margin, right: size - left - margin })
-                : ({ top, bottom }) => ({ left: top + margin, right: bottom + margin })
+                : ({ top, bottom }) =>
+                    ({ left: top + margin + offset, right: bottom + margin + offset })
         }
         const pxSize = this.pages * this.size
         return this.#rtl
@@ -991,7 +1016,8 @@ export class Paginator extends HTMLElement {
         }
         // if anchor is a fraction
         if (this.scrolled) {
-            await this.#scrollTo(anchor * this.viewSize, reason)
+            // Nyxa: measured from where the current chapter starts
+            await this.#scrollTo(this.#offsetOf(this.#view) + anchor * this.viewSize, reason)
             return
         }
         const { pages } = this
@@ -1008,16 +1034,20 @@ export class Paginator extends HTMLElement {
             this.start - size, this.end - size, this.#getRectMapper())
     }
     #afterScroll(reason) {
+        const moved = reason !== 'selection' && reason !== 'navigation' && reason !== 'anchor'
+        // Nyxa: you scrolled, so maybe you're in another chapter now
+        if (moved) this.#followScreen()
         const range = this.#getVisibleRange()
         this.#lastVisibleRange = range
         // don't set new anchor if relocation was to scroll to anchor
-        if (reason !== 'selection' && reason !== 'navigation' && reason !== 'anchor')
+        if (moved)
             this.#anchor = range
         else this.#justAnchored = true
 
         const index = this.#index
         const detail = { reason, range, index }
-        if (this.scrolled) detail.fraction = this.start / this.viewSize
+        if (this.scrolled) // Nyxa: how far through the current chapter
+            detail.fraction = (this.start - this.#offsetOf(this.#view)) / this.viewSize
         else if (this.pages > 0) {
             const { page, pages } = this
             this.#header.style.visibility = page > 1 ? 'visible' : 'hidden'
@@ -1042,11 +1072,19 @@ export class Paginator extends HTMLElement {
             this.#attachOverlayer(view, index)
             this.#view = view
         }
-        await this.scrollToAnchor((typeof anchor === 'function'
-            ? anchor(this.#view.document) : anchor) ?? 0, select)
+        const place = (typeof anchor === 'function'
+            ? anchor(this.#view.document) : anchor) ?? 0
+        await this.scrollToAnchor(place, select)
+        // Nyxa: a place near the end of a chapter can't reach the top of the
+        // screen yet. #fill brings it up once there's a chapter underneath
+        this.#waiting = this.#stacking && this.#atBottom()
+            && this.#adjacentIndex(1) != null ? { place, select } : null
         if (hasFocus) this.focusView()
     }
-
+    #atBottom() {
+        const { scrollTop, scrollHeight, clientHeight } = this.#container
+        return scrollTop + 1 >= scrollHeight - clientHeight
+    }
     // Nyxa: moved out of #display so stacked chapters can use them too
     #addStyleElements(doc) {
         if (doc.head) {
@@ -1132,7 +1170,8 @@ export class Paginator extends HTMLElement {
         this.#locked = true
         const prev = dir === -1
         const shouldGo = await (prev ? this.#scrollPrev(distance) : this.#scrollNext(distance))
-        if (shouldGo) await this.#goTo({
+        // Nyxa: stop at the first and last chapter (it used to throw and lock up)
+        if (shouldGo && this.#adjacentIndex(dir) != null) await this.#goTo({
             index: this.#adjacentIndex(dir),
             anchor: prev ? () => 1 : () => 0,
         })
