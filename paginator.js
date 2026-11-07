@@ -1,4 +1,4 @@
-import { chapterAt } from './stack.js'
+import { chapterAt, isFar } from './stack.js'
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
 
@@ -454,6 +454,7 @@ export class Paginator extends HTMLElement {
     // Nyxa: the chapters on the page, top to bottom, as { index, view }
     #stack = []
     #filling = false
+    #heights = new WeakMap() // Nyxa: each chapter's height last time we looked
     #waiting = null
     constructor() {
         super()
@@ -518,6 +519,8 @@ export class Paginator extends HTMLElement {
             grid-column: 1 / -1;
             grid-row: 1 / -1;
             overflow: auto;
+            /* Nyxa: we keep the reading line still ourselves, see #onExpand */
+            overflow-anchor: none;
         }
         #header {
             grid-column: 3 / 4;
@@ -567,6 +570,7 @@ export class Paginator extends HTMLElement {
         this.#container.addEventListener('scroll', () => this.#fill().catch(e => console.warn(e)))
         this.#container.addEventListener('scroll', debounce(() => {
             if (this.scrolled) {
+                this.#forgetFar() // Nyxa
                 if (this.#justAnchored) this.#justAnchored = false
                 else this.#afterScroll('scroll')
             }
@@ -691,17 +695,30 @@ export class Paginator extends HTMLElement {
         view.element.remove()
         if (unload) this.sections[index]?.unload?.()
     }
-    // Nyxa: a chapter changed height. The current one keeps your place, like before
+    // Nyxa: a chapter changed height. The current one keeps your place, like before.
+    // One above the screen pushes the story down, so scroll down by the same amount.
     #onExpand(view) {
+        if (!view.element.isConnected) return // already freed
+        const height = view.element.getBoundingClientRect().height
+        const change = height - (this.#heights.get(view) ?? 0)
+        this.#heights.set(view, height)
         if (view === this.#view) this.#scrollToAnchor(this.#anchor)
+        else if (this.#offsetOf(view) < this.#offsetOf(this.#view))
+            this.#container.scrollTop += change
     }
     // Nyxa: less than 2 screens of story left below? add the next chapter
+    // Nyxa: less than 2 screens of story left below or above? add a chapter there
     async #fill() {
         if (!this.#stacking || this.#filling || !this.#view) return
+        const near = this.size * 2
         const next = this.#adjacentIndex(1, this.#stack.at(-1).index)
-        if (next == null || this.#container.scrollHeight - this.end > this.size * 2) return
+        const prev = this.#adjacentIndex(-1, this.#stack[0].index)
+        let above
+        if (next != null && this.#container.scrollHeight - this.end < near) above = false
+        else if (prev != null && this.start < near) above = true
+        else return
         this.#filling = true
-        if (!(await this.#addChapter(next))) return // a jump happened meanwhile
+        if (!(await this.#addChapter(above ? prev : next, above))) return // a jump happened meanwhile
         this.#filling = false
         if (this.#waiting) {
             const { place, select } = this.#waiting
@@ -710,8 +727,23 @@ export class Paginator extends HTMLElement {
         }
         await this.#fill() // a short chapter may not be enough
     }
-    // Nyxa: load one chapter into a new view at the bottom of the stack
-    async #addChapter(index) {
+    // Nyxa: free chapters far from the screen, so memory doesn't fill up
+    #forgetFar() {
+        if (!this.#stacking || this.#filling) return
+        for (const entry of [...this.#stack]) {
+            if (entry.view === this.#view) continue
+            const top = this.#offsetOf(entry.view)
+            const height = entry.view.element.getBoundingClientRect().height
+            if (!isFar(top, top + height, this.start, this.end, this.size * 3)) continue
+            const scrollTop = this.#container.scrollTop
+            this.#stack.splice(this.#stack.indexOf(entry), 1)
+            this.#free(entry)
+            // the story moved up by its height, so scroll up by the same amount
+            if (top < scrollTop) this.#container.scrollTop = scrollTop - height
+        }
+    }
+    // Nyxa: load one chapter into a new view at the bottom (or top) of the stack
+    async #addChapter(index, above = false) {
         const stack = this.#stack
         const src = await this.sections[index].load()
         if (stack !== this.#stack) return false
@@ -719,8 +751,14 @@ export class Paginator extends HTMLElement {
             container: this,
             onExpand: () => this.#onExpand(view),
         })
-        stack.push({ index, view })
-        this.#container.append(view.element)
+        if (above) {
+            view.element.style.height = '0' // starts empty, #onExpand handles the growing
+            stack.unshift({ index, view })
+            this.#container.prepend(view.element)
+        } else {
+            stack.push({ index, view })
+            this.#container.append(view.element)
+        }
         await view.load(src, doc => {
             this.#addStyleElements(doc)
             this.#applyStyles(view)
