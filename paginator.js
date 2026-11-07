@@ -706,7 +706,6 @@ export class Paginator extends HTMLElement {
         else if (this.#offsetOf(view) < this.#offsetOf(this.#view))
             this.#container.scrollTop += change
     }
-    // Nyxa: less than 2 screens of story left below? add the next chapter
     // Nyxa: less than 2 screens of story left below or above? add a chapter there
     async #fill() {
         if (!this.#stacking || this.#filling || !this.#view) return

@@ -29,3 +29,7 @@ test('isFar finds chapters far above or below', () => {
     expect(isFar(0, 3000, 5000, 5600, 1800)).toBe(true)
     expect(isFar(7500, 9000, 5000, 5600, 1800)).toBe(true)
 })
+
+test('exactly distance above is kept', () => {
+    expect(isFar(1000, 3200, 5000, 5600, 1800)).toBe(false) // 5000 - 1800 = 3200
+})
